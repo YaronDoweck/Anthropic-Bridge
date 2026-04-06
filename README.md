@@ -49,6 +49,17 @@ chmod +x scripts/*.sh
 
 ## Configuration
 
+Server settings can also be configured in `proxy.config` under `[server]`:
+
+| Field           | Default       | Description |
+|-----------------|---------------|-------------|
+| `host`          | `127.0.0.1`   | Bind address |
+| `port`          | `8000`        | Listen port |
+| `log_level`     | `INFO`        | Log verbosity |
+| `debug_level`   | `0`           | Request/response body logging: `0`=off, `1`=summary, `2`=full JSON |
+| `output_dir`    | _(disabled)_  | Directory for per-session JSONL log files |
+| `override_model`| _(disabled)_  | Force all requests to a specific model (useful for testing) |
+
 All routing is controlled by `proxy.config`. Map each model name you plan to use to either `"anthropic"` or `"ollama"`:
 
 ```toml
@@ -84,7 +95,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 
 Now each subagent can be configured with any model name defined in `proxy.config`, and the proxy will route it to the right backend automatically.
 
-## Environment Variables
+## (Optional) Fallback API keys - Environment Variables
 
 Copy `.env.example` to `.env` and set your credentials:
 
@@ -93,16 +104,6 @@ Copy `.env.example` to `.env` and set your credentials:
 | `ANTHROPIC_AUTH_TOKEN` | _(unset)_   | Fallback bearer token for Anthropic requests when the client sends no auth headers |
 | `ANTHROPIC_API_KEY`    | _(unset)_   | Fallback API key (lower priority than `ANTHROPIC_AUTH_TOKEN`) |
 
-Server settings can also be configured in `proxy.config` under `[server]`:
-
-| Field           | Default       | Description |
-|-----------------|---------------|-------------|
-| `host`          | `127.0.0.1`   | Bind address |
-| `port`          | `8000`        | Listen port |
-| `log_level`     | `INFO`        | Log verbosity |
-| `debug_level`   | `0`           | Request/response body logging: `0`=off, `1`=summary, `2`=full JSON |
-| `output_dir`    | _(disabled)_  | Directory for per-session JSONL log files |
-| `override_model`| _(disabled)_  | Force all requests to a specific model (useful for testing) |
 
 ## Running
 
