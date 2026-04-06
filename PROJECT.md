@@ -1,6 +1,6 @@
 # Project Overview: LLM Proxy
 
-A FastAPI proxy that accepts **Anthropic-format API requests** and routes them to either the **Anthropic API** (pass-through) or a local **Ollama instance** (with Anthropic↔OpenAI format conversion), based on the model name in the request.
+A FastAPI proxy that accepts **Anthropic-format API requests** and routes them to either the **Anthropic API** (pass-through) or a local **Ollama instance** (native Anthropic format), based on the model name in the request.
 
 ---
 
@@ -21,13 +21,9 @@ handlers/   handlers/
 anthropic   ollama
 .py         .py
    │         │
-   │         ▼
-   │    converters/anthropic_openai.py
-   │         (Anthropic ↔ OpenAI format)
-   │         │
    ▼         ▼
 Anthropic  Ollama
-  API      (local)
+  API      (local, Anthropic-compatible)
 ```
 
 ---
@@ -45,8 +41,8 @@ Anthropic  Ollama
 | `.env` | Private credentials only: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY |
 | `handlers/base.py` | Abstract `BaseHandler` interface |
 | `handlers/anthropic.py` | Pass-through to Anthropic API, injects fallback auth |
-| `handlers/ollama.py` | Converts format, forwards to Ollama, converts back |
-| `converters/anthropic_openai.py` | Pure functions: Anthropic↔OpenAI request/response/streaming |
+| `handlers/ollama.py` | Forwards to Ollama Anthropic-compatible endpoint; handles system-reminder extraction |
+| `converters/anthropic_openai.py` | Pure functions: Anthropic↔OpenAI (used by tests only) |
 | `tests/conftest.py` | Pytest fixtures: `proxy_config`, `test_port`, `running_server` |
 | `tests/test_converters.py` | Unit tests for converters (no network) |
 | `tests/test_router.py` | Router tests via TestClient with mocked httpx |
@@ -113,24 +109,20 @@ Keep this file for private credentials only — do not commit it.
 3. Looks up `ModelConfig` in `proxy.config` — returns 400 if not found
 4. Dispatches to handler based on `model_config.endpoint`
 5. **Anthropic handler**: forwards all headers as-is (except hop-by-hop), injects fallback auth if needed, streams or buffers Anthropic SSE/JSON unchanged
-6. **Ollama handler**: strips Anthropic-specific headers, converts body to OpenAI format, forwards to `/v1/chat/completions`, converts response back to Anthropic format
+6. **Ollama handler**: strips non-essential headers, applies system-reminder handling if configured, forwards request unchanged to Ollama's Anthropic-compatible endpoint, streams or buffers response unchanged
 7. All errors returned in Anthropic error schema: `{"type": "error", "error": {"type": "...", "message": "..."}}`
 
 ---
 
-## Format Conversion (Anthropic ↔ OpenAI)
+## Ollama System-Reminder Handling
 
-**Request (Anthropic → OpenAI):**
-- `system` field → prepended `{"role": "system", ...}` message
-- `content` list of blocks → text joined into string, `tool_use` blocks converted to OpenAI `tool_calls`, `tool_result` blocks converted to `role: tool` messages (image blocks dropped with warning)
-- `stop_sequences` → `stop`
+Controlled per-model via `claude_system_instructions` in `proxy.config`:
 
-**Response (OpenAI → Anthropic):**
-- `choices[0].message.content` → `content: [{type: "text", text: "..."}]`
-- `finish_reason`: `stop`→`end_turn`, `length`→`max_tokens`
-- `usage`: `prompt_tokens`→`input_tokens`, `completion_tokens`→`output_tokens`
+- `passthrough` (default): body forwarded unchanged
+- `strip`: strips everything up to and including `</system-reminder>\n\n` from the `system` field
+- `split`: extracts `<system-reminder>` blocks from user messages and appends their content to the `system` field
 
-**Streaming:** OpenAI SSE chunks are converted to the full Anthropic SSE event sequence: `message_start` → `content_block_start` → `ping` → N×`content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`
+`omit_claude_main_description = true` (default): removes the `system` field entirely before forwarding (has no effect when `claude_system_instructions = "passthrough"`).
 
 ---
 
@@ -177,8 +169,7 @@ endpoint = "ollama"   # or "anthropic"
 
 ## Known Limitations / Deferred Items
 
-- Image content blocks are dropped when routing to Ollama; tool use is supported
-- Streaming errors from Ollama arrive as HTTP 200 with a partial event stream (Ollama error is not converted before StreamingResponse commits)
+- Streaming errors from Ollama arrive as HTTP 200 with a partial event stream
 - No request body size limit
 - `log_request()` in `logging_config.py` is defined but not yet called from handlers
 - Blocking subprocess calls in `startup_checks.py` run on the asyncio event loop thread (acceptable for startup-only use)
