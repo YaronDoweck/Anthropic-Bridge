@@ -1,7 +1,7 @@
 [project]
-name = "llm-proxy"
+name = "anthropic-bridge"
 version = "0.1.0"
-description = "LLM routing proxy — Anthropic format to Anthropic or Ollama"
+description = "Route Anthropic-format requests to Anthropic API or local Ollama models — use any mix of cloud and local models in Claude Code subagents"
 requires-python = ">=3.9"
 dependencies = [
     "fastapi",
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-llm-proxy = "server:main"
+anthropic-bridge = "server:main"
 
 [tool.hatch.build.targets.wheel]
 sources = ["."]
