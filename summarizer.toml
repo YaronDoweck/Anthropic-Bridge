@@ -1,0 +1,11 @@
+# Ollama model to use for summarization
+model = "gemma4:26b"
+
+# Ollama base URL
+ollama_url = "http://127.0.0.1:11434"
+
+# Path to the JSONL log file (produced by the proxy's OUTPUT_FILE env var)
+#input_file = "proxy_output.jsonl"
+
+# Path for the summary output file (Markdown)
+#output_file = "summaries.md"

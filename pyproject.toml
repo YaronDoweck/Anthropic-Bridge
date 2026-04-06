@@ -1,0 +1,30 @@
+[project]
+name = "llm-proxy"
+version = "0.1.0"
+description = "LLM routing proxy — Anthropic format to Anthropic or Ollama"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "python-dotenv",
+    "tomli; python_version < '3.11'",
+]
+
+[project.scripts]
+llm-proxy = "server:main"
+
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+include = ["*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-httpx",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

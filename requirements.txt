@@ -1,0 +1,1 @@
+# Dependencies are managed with uv. See pyproject.toml. Run: uv sync
