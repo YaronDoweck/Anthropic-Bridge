@@ -1,7 +1,8 @@
 """
 RequestLogger: appends JSONL entries for every proxied request/response.
+RawLogger: appends raw incoming request bodies to a single JSONL file.
 
-Activated when the OUTPUT_DIR environment variable is set.
+Activated when the OUTPUT_DIR / RAW_LOG_DIR environment variables are set.
 Each session writes to its own <session_id>.jsonl file inside the output directory.
 All I/O is wrapped in try/except so a logging failure never crashes the proxy.
 """
@@ -88,18 +89,34 @@ class RequestLogger:
         try:
             parsed = json.loads(response_body)
             content_blocks = parsed.get("content", [])
-            response_text = "".join(
-                block.get("text", "")
-                for block in content_blocks
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
+            text_parts = []
+            thinking_parts = []
+            for block in content_blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "thinking":
+                    thinking_parts.append(block.get("thinking", ""))
+                elif block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    input_data = json.dumps(block.get("input", {}), ensure_ascii=False)
+                    text_parts.append(f"[tool_use: {name}] {input_data}".strip())
+            response_text = "\n".join(text_parts)
+            thinking_text = "\n".join(thinking_parts)
             usage = parsed.get("usage", {})
-            input_tokens: Optional[int] = usage.get("input_tokens")
+            _raw_input = usage.get("input_tokens")
+            input_tokens: Optional[int] = (
+                _raw_input
+                + (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+            ) if _raw_input is not None else None
             output_tokens: Optional[int] = usage.get("output_tokens")
             stop_reason: Optional[str] = parsed.get("stop_reason")
         except Exception as exc:
             logger.warning("RequestLogger: failed to parse buffered response: %s", exc)
             response_text = ""
+            thinking_text = ""
             input_tokens = None
             output_tokens = None
             stop_reason = None
@@ -112,6 +129,7 @@ class RequestLogger:
                 "stream": False,
                 "status_code": status_code,
                 "request_body": request_body,
+                "thinking_text": thinking_text,
                 "response_text": response_text,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -139,6 +157,11 @@ class RequestLogger:
         output_tokens: Optional[int] = None
         stop_reason: Optional[str] = None
         leftover = ""  # buffer for partial SSE lines split across chunks
+        # Tool use tracking: index -> {name, partial_json_parts}
+        tool_blocks: dict[int, dict] = {}
+        # Thinking tracking: index -> [parts]
+        thinking_blocks: dict[int, list] = {}
+        current_block_index: Optional[int] = None
 
         try:
             async for chunk in original_generator:
@@ -168,7 +191,23 @@ class RequestLogger:
                             usage = msg.get("usage", {})
                             val = usage.get("input_tokens")
                             if val is not None:
-                                input_tokens = val
+                                input_tokens = (
+                                    val
+                                    + (usage.get("cache_read_input_tokens") or 0)
+                                    + (usage.get("cache_creation_input_tokens") or 0)
+                                )
+
+                        elif event_type == "content_block_start":
+                            block = event_data.get("content_block", {})
+                            idx = event_data.get("index", 0)
+                            current_block_index = idx
+                            if block.get("type") == "tool_use":
+                                tool_blocks[idx] = {
+                                    "name": block.get("name", ""),
+                                    "parts": [],
+                                }
+                            elif block.get("type") == "thinking":
+                                thinking_blocks[idx] = []
 
                         elif event_type == "content_block_delta":
                             delta = event_data.get("delta", {})
@@ -176,6 +215,18 @@ class RequestLogger:
                                 text = delta.get("text", "")
                                 if text:
                                     accumulated_text.append(text)
+                            elif delta.get("type") == "input_json_delta":
+                                idx = event_data.get("index", current_block_index)
+                                if idx in tool_blocks:
+                                    partial = delta.get("partial_json", "")
+                                    if partial:
+                                        tool_blocks[idx]["parts"].append(partial)
+                            elif delta.get("type") == "thinking_delta":
+                                idx = event_data.get("index", current_block_index)
+                                if idx in thinking_blocks:
+                                    thinking = delta.get("thinking", "")
+                                    if thinking:
+                                        thinking_blocks[idx].append(thinking)
 
                         elif event_type == "message_delta":
                             delta = event_data.get("delta", {})
@@ -188,11 +239,30 @@ class RequestLogger:
                                 output_tokens = val
                             val = usage.get("input_tokens")
                             if val is not None:
-                                input_tokens = val
+                                input_tokens = (
+                                    val
+                                    + (usage.get("cache_read_input_tokens") or 0)
+                                    + (usage.get("cache_creation_input_tokens") or 0)
+                                )
 
                 except Exception as exc:
                     logger.warning("RequestLogger: error parsing SSE chunk: %s", exc)
         finally:
+            thinking_text = ""
+            if thinking_blocks:
+                t_parts = []
+                for thinking_parts_list in thinking_blocks.values():
+                    t_parts.append("".join(thinking_parts_list))
+                thinking_text = "\n".join(t_parts)
+
+            response_parts = []
+            if accumulated_text:
+                response_parts.append("".join(accumulated_text))
+            for block in tool_blocks.values():
+                name = block["name"]
+                partial_json = "".join(block["parts"])
+                response_parts.append(f"[tool_use: {name}] {partial_json}".strip())
+            response_text = "\n".join(response_parts)
             entry = {
                 "timestamp": timestamp,
                 "model": model,
@@ -200,7 +270,8 @@ class RequestLogger:
                 "stream": True,
                 "status_code": 200,
                 "request_body": request_body,
-                "response_text": "".join(accumulated_text),
+                "thinking_text": thinking_text,
+                "response_text": response_text,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "stop_reason": stop_reason,
@@ -208,3 +279,48 @@ class RequestLogger:
             # Run blocking file I/O in a thread to avoid blocking the event loop
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda e=entry: self.log_entry(e, session_id=session_id))
+
+
+class RawLogger:
+    """Appends raw incoming request bodies to a single raw_requests.jsonl file."""
+
+    def __init__(self, output_dir: str) -> None:
+        self._path: Optional[str] = None
+        self._lock = threading.Lock()
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            if not os.access(output_dir, os.W_OK):
+                raise OSError(f"Directory is not writable: {output_dir}")
+            self._path = os.path.join(output_dir, "raw_requests.jsonl")
+        except OSError as exc:
+            logger.warning(
+                "RawLogger: cannot use output directory %r: %s — raw logging disabled",
+                output_dir,
+                exc,
+            )
+
+    def log(self, timestamp: str, method: str, path: str, body: str) -> None:
+        """Append one raw request entry. Never raises."""
+        if self._path is None:
+            return
+        try:
+            entry = {"timestamp": timestamp, "direction": "request", "method": method, "path": path, "body": body}
+            line = json.dumps(entry, ensure_ascii=False)
+            with self._lock:
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception as exc:
+            logger.warning("RawLogger: failed to write entry: %s", exc)
+
+    def log_response(self, timestamp: str, method: str, path: str, status_code: int, body: str) -> None:
+        """Append one raw response entry. Never raises."""
+        if self._path is None:
+            return
+        try:
+            entry = {"timestamp": timestamp, "direction": "response", "method": method, "path": path, "status_code": status_code, "body": body}
+            line = json.dumps(entry, ensure_ascii=False)
+            with self._lock:
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception as exc:
+            logger.warning("RawLogger: failed to write response entry: %s", exc)

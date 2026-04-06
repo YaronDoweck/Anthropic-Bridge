@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from config import ProxyConfig
 from handlers.anthropic import AnthropicHandler
 from handlers.ollama import OllamaHandler
-from request_logger import RequestLogger, _extract_session_id
+from request_logger import RequestLogger, RawLogger, _extract_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +43,11 @@ class ProxyRouter:
         config: ProxyConfig,
         http_client: httpx.AsyncClient,
         request_logger: Optional[RequestLogger] = None,
+        raw_logger: Optional[RawLogger] = None,
     ) -> None:
         self.config = config
         self.request_logger = request_logger
+        self.raw_logger = raw_logger
         self.handlers = {
             "anthropic": AnthropicHandler(
                 base_url=config.anthropic_url,

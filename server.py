@@ -15,7 +15,7 @@ import logging
 
 from config import ProxyConfig, load_config
 from logging_config import setup_logging
-from request_logger import RequestLogger
+from request_logger import RequestLogger, RawLogger
 from router import ProxyRouter
 from startup_checks import run_startup_checks
 
@@ -48,6 +48,9 @@ def _apply_env_overrides(config: ProxyConfig) -> None:
     env_output_dir = os.getenv("OUTPUT_DIR")
     if env_output_dir is not None:
         config.server.output_dir = env_output_dir
+    env_raw_log_dir = os.getenv("RAW_LOG_DIR")
+    if env_raw_log_dir is not None:
+        config.server.raw_log_dir = env_raw_log_dir
     env_override_model = os.getenv("OVERRIDE_MODEL")
     if env_override_model is not None:
         config.server.override_model = env_override_model.strip()
@@ -78,10 +81,14 @@ async def lifespan(app: FastAPI):
         async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
             output_dir = config.server.output_dir or None
             req_logger = RequestLogger(output_dir) if output_dir else None
-            router_instance = ProxyRouter(config, client, request_logger=req_logger)
+            raw_log_dir = config.server.raw_log_dir or config.server.output_dir or None
+            raw_logger = RawLogger(raw_log_dir) if raw_log_dir else None
+            app.state.raw_logger = raw_logger
+            router_instance = ProxyRouter(config, client, request_logger=req_logger, raw_logger=raw_logger)
             yield
     finally:
         router_instance = None
+        app.state.raw_logger = None
         if ollama_proc is not None:
             ollama_proc.terminate()
             try:
@@ -91,6 +98,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+import datetime as _dt
+
+@app.middleware("http")
+async def _raw_logging_middleware(request: Request, call_next):
+    raw_logger = getattr(app.state, "raw_logger", None)
+    if raw_logger is None:
+        return await call_next(request)
+
+    raw_body = await request.body()
+    timestamp = _dt.datetime.now().isoformat()
+    body_str = raw_body.decode("utf-8", errors="replace")
+    raw_logger.log(timestamp, request.method, request.url.path, body_str)
+
+    response = await call_next(request)
+
+    # Wrap the body iterator to capture chunks while still streaming to the client
+    original_iterator = response.body_iterator
+    method = request.method
+    path = str(request.url.path)
+    status_code = response.status_code
+
+    async def capturing_iterator():
+        chunks = []
+        try:
+            async for chunk in original_iterator:
+                chunks.append(chunk)
+                yield chunk
+        finally:
+            full_body = b"".join(chunks)
+            raw_logger.log_response(timestamp, method, path, status_code, full_body.decode("utf-8", errors="replace"))
+
+    response.body_iterator = capturing_iterator()
+    return response
 
 
 @app.api_route(

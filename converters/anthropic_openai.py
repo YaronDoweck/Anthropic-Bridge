@@ -115,10 +115,12 @@ def convert_anthropic_to_openai_request(body: dict) -> dict:
             content_str = content
             tool_use_blocks: list[dict] = []
             tool_result_messages: list[dict] = []
+            thinking_parts: list[str] = []
         elif isinstance(content, list):
             text_parts: list[str] = []
             tool_use_blocks = []
             tool_result_messages = []
+            thinking_parts: list[str] = []
             for block in content:
                 if isinstance(block, dict):
                     btype = block.get("type")
@@ -128,6 +130,8 @@ def convert_anthropic_to_openai_request(body: dict) -> dict:
                         tool_use_blocks.append(block)
                     elif btype == "tool_result":
                         tool_result_messages.append(_convert_tool_result_to_openai(block))
+                    elif btype == "thinking":
+                        thinking_parts.append(block.get("thinking", ""))
                     else:
                         logger.warning(
                             "Skipping unsupported content block type '%s' in conversion",
@@ -140,6 +144,7 @@ def convert_anthropic_to_openai_request(body: dict) -> dict:
             content_str = str(content)
             tool_use_blocks = []
             tool_result_messages = []
+            thinking_parts = []
 
         if role == "user":
             reminders, content_str = _extract_system_reminders(content_str)
@@ -151,15 +156,22 @@ def convert_anthropic_to_openai_request(body: dict) -> dict:
             if content_str:
                 messages.append({"role": "user", "content": content_str})
         elif role == "assistant":
+            reasoning = "\n".join(thinking_parts) if thinking_parts else None
             if tool_use_blocks:
                 content_val = content_str if content_str else None
-                messages.append({
+                msg: dict = {
                     "role": "assistant",
                     "content": content_val,
                     "tool_calls": [_convert_tool_use_to_openai(b) for b in tool_use_blocks],
-                })
+                }
+                if reasoning:
+                    msg["reasoning"] = reasoning
+                messages.append(msg)
             else:
-                messages.append({"role": "assistant", "content": content_str})
+                msg = {"role": "assistant", "content": content_str}
+                if reasoning:
+                    msg["reasoning"] = reasoning
+                messages.append(msg)
         else:
             messages.append({"role": role, "content": content_str})
 
@@ -222,7 +234,7 @@ def convert_openai_to_anthropic_response(openai_resp: dict, model: str) -> dict:
     content_blocks = []
 
     # Thinking / reasoning content (comes before text)
-    reasoning_content = message.get("reasoning_content")
+    reasoning_content = message.get("reasoning_content") or message.get("reasoning")
 
     # Text content
     text_content = message.get("content")
@@ -355,7 +367,7 @@ async def convert_openai_stream_to_anthropic(
             stop_reason = _FINISH_REASON_MAP.get(finish_reason, "end_turn")
 
         # --- Reasoning/thinking content (dedicated field) ---
-        reasoning_content = delta.get("reasoning_content")
+        reasoning_content = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning_content:
             if not thinking_block_started:
                 has_thinking = True
@@ -365,7 +377,7 @@ async def convert_openai_stream_to_anthropic(
                 yield _sse("content_block_start", {
                     "type": "content_block_start",
                     "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    "content_block": {"type": "thinking", "thinking": ""},
                 })
             yield _sse("content_block_delta", {
                 "type": "content_block_delta",
@@ -390,7 +402,7 @@ async def convert_openai_stream_to_anthropic(
                     yield _sse("content_block_start", {
                         "type": "content_block_start",
                         "index": 0,
-                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                        "content_block": {"type": "thinking", "thinking": ""},
                     })
                     after_tag = stripped[len("<think>"):]
                     if "</think>" in after_tag:
@@ -492,6 +504,18 @@ async def convert_openai_stream_to_anthropic(
                     text_block_started = False
                     text_block_closed = False
                 if not text_block_started:
+                    # Close thinking block before opening text block
+                    if thinking_block_started and not thinking_block_closed:
+                        yield _sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "signature_delta", "signature": ""},
+                        })
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": 0,
+                        })
+                        thinking_block_closed = True
                     yield _sse("content_block_start", {
                         "type": "content_block_start",
                         "index": text_block_index,

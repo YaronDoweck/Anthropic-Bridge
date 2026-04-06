@@ -15,6 +15,7 @@ class ServerConfig:
     log_level: str = "INFO"
     debug_level: int = 0
     output_dir: str = ""
+    raw_log_dir: str = ""
     override_model: str = ""
 
 
@@ -110,6 +111,8 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
             server.output_dir = str(server_raw["output_dir"])
         elif "output_file" in server_raw:
             server.output_dir = str(server_raw["output_file"])
+        if "raw_log_dir" in server_raw:
+            server.raw_log_dir = str(server_raw["raw_log_dir"])
         if "override_model" in server_raw:
             server.override_model = str(server_raw["override_model"]).strip()
 

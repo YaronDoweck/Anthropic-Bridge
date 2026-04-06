@@ -156,6 +156,12 @@ def build_prompt(entry: dict) -> str:
     if len(response_text) > 3000:
         response_text = response_text[:3000] + "... [truncated]"
 
+    thinking_text = entry.get("thinking_text", "")
+    if thinking_text:
+        if len(thinking_text) > 2000:
+            thinking_text = thinking_text[:2000] + "... [truncated]"
+        response_text = f"[thinking]\n{thinking_text}\n\n[response]\n{response_text}"
+
     return PROMPT_TEMPLATE.format(
         timestamp=entry.get("timestamp", "N/A"),
         model=entry.get("model", "N/A"),
