@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+import logging
+
 from config import ProxyConfig, load_config
 from logging_config import setup_logging
 from request_logger import RequestLogger
@@ -43,15 +45,27 @@ def _apply_env_overrides(config: ProxyConfig) -> None:
             config.server.debug_level = max(0, min(3, int(env_debug_level)))
         except ValueError:
             raise RuntimeError(f"Invalid DEBUG_LEVEL env var: {env_debug_level!r} is not an integer")
-    env_output_file = os.getenv("OUTPUT_FILE")
-    if env_output_file is not None:
-        config.server.output_file = env_output_file
+    env_output_dir = os.getenv("OUTPUT_DIR")
+    if env_output_dir is not None:
+        config.server.output_dir = env_output_dir
+    env_override_model = os.getenv("OVERRIDE_MODEL")
+    if env_override_model is not None:
+        config.server.override_model = env_override_model.strip()
 
 
 load_dotenv()
 config = load_config()
 _apply_env_overrides(config)
+if config.server.override_model and config.server.override_model not in config.models:
+    available = ", ".join(sorted(config.models.keys()))
+    raise RuntimeError(
+        f"override_model '{config.server.override_model}' is not defined in [models]. "
+        f"Available models: {available}"
+    )
 setup_logging(log_level=config.server.log_level, debug_level=config.server.debug_level)
+_log = logging.getLogger(__name__)
+if config.server.override_model:
+    _log.warning("OVERRIDE MODE ACTIVE: all requests will use model '%s'", config.server.override_model)
 
 router_instance: Optional[ProxyRouter] = None
 
@@ -62,8 +76,8 @@ async def lifespan(app: FastAPI):
     ollama_proc = run_startup_checks(config)
     try:
         async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
-            output_file = config.server.output_file or None
-            req_logger = RequestLogger(output_file) if output_file else None
+            output_dir = config.server.output_dir or None
+            req_logger = RequestLogger(output_dir) if output_dir else None
             router_instance = ProxyRouter(config, client, request_logger=req_logger)
             yield
     finally:

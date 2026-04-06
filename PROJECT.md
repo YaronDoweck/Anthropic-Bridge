@@ -65,7 +65,7 @@ host = "127.0.0.1"
 port = 8000
 log_level = "INFO"
 debug_level = 0
-# output_file = "/path/to/output.jsonl"
+# output_dir = "/path/to/logs"
 
 [endpoints]
 anthropic_url = "https://api.anthropic.com"
@@ -88,9 +88,10 @@ The `[server]` section is fully optional — all fields have defaults. Each mode
 | `port` | `8000` | Listen port |
 | `log_level` | `INFO` | Python log level name (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
 | `debug_level` | `0` | Verbosity of request/response body logging: 0=off, 1=one-line summary, 2=full pretty-printed JSON, 3=reserved for future use. Setting ≥1 forces root logger to DEBUG. |
-| `output_file` | `""` | Path to JSONL output file for logging all requests/responses. Empty string means disabled. |
+| `output_dir` | `""` | Path to directory for per-session JSONL log files. Each session writes to `<session_id>.jsonl` in this directory. Empty string means disabled. |
+| `override_model` | `""` | When set, all requests are routed to this model regardless of the incoming `model` field. Must be defined in `[models]`. Empty = disabled. |
 
-Environment variables override `proxy.config` values when set (e.g. `LOG_LEVEL=DEBUG uv run llm-proxy` still works). The env var names mirror the field names: `HOST`, `PORT`, `LOG_LEVEL`, `DEBUG_LEVEL`, `OUTPUT_FILE`.
+Environment variables override `proxy.config` values when set (e.g. `LOG_LEVEL=DEBUG uv run llm-proxy` still works). The env var names mirror the field names: `HOST`, `PORT`, `LOG_LEVEL`, `DEBUG_LEVEL`, `OUTPUT_DIR`, `OVERRIDE_MODEL`.
 
 ### `.env`
 
@@ -121,7 +122,7 @@ Keep this file for private credentials only — do not commit it.
 
 **Request (Anthropic → OpenAI):**
 - `system` field → prepended `{"role": "system", ...}` message
-- `content` list of blocks → joined text string (non-text blocks dropped with warning)
+- `content` list of blocks → text joined into string, `tool_use` blocks converted to OpenAI `tool_calls`, `tool_result` blocks converted to `role: tool` messages (image blocks dropped with warning)
 - `stop_sequences` → `stop`
 
 **Response (OpenAI → Anthropic):**
@@ -176,7 +177,7 @@ endpoint = "ollama"   # or "anthropic"
 
 ## Known Limitations / Deferred Items
 
-- Non-text content blocks (images, tool use) are dropped when routing to Ollama
+- Image content blocks are dropped when routing to Ollama; tool use is supported
 - Streaming errors from Ollama arrive as HTTP 200 with a partial event stream (Ollama error is not converted before StreamingResponse commits)
 - No request body size limit
 - `log_request()` in `logging_config.py` is defined but not yet called from handlers

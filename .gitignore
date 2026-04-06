@@ -28,6 +28,7 @@ build/
 *.jsonl
 *.log
 output*.md
+logs/
 
 # macOS
 .DS_Store

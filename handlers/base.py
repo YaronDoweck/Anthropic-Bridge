@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Optional, Union
 
 import httpx
 from fastapi import Request
@@ -22,5 +22,10 @@ class BaseHandler(ABC):
         path: str,
         body: dict,
         model_config: ModelConfig,
-    ) -> Union[Response, StreamingResponse]:
+    ) -> tuple[Union[Response, StreamingResponse], Optional[dict]]:
+        """
+        Handle the request and return (response, sent_body).
+        sent_body is the request body as actually sent to the backend,
+        or None if the original body was sent unchanged.
+        """
         ...

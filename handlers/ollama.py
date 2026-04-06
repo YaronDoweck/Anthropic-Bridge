@@ -12,7 +12,7 @@ import json
 import re
 import logging
 import uuid
-from typing import Union
+from typing import Optional, Union
 
 import httpx
 from fastapi import Request
@@ -59,7 +59,7 @@ class OllamaHandler(BaseHandler):
         path: str,
         body: dict,
         model_config: ModelConfig,
-    ) -> Union[Response, StreamingResponse]:
+    ) -> tuple[Union[Response, StreamingResponse], Optional[dict]]:
         ollama_path = _map_path(path)
         url = f"{self.base_url}/{ollama_path}"
         if request.url.query:
@@ -124,9 +124,10 @@ class OllamaHandler(BaseHandler):
         is_streaming = body.get("stream", False)
 
         if is_streaming:
-            return await self._handle_streaming(url, headers, openai_body, model_name, debug_level)
+            response = await self._handle_streaming(url, headers, openai_body, model_name, debug_level)
         else:
-            return await self._handle_buffered(url, headers, openai_body, model_name, debug_level)
+            response = await self._handle_buffered(url, headers, openai_body, model_name, debug_level)
+        return (response, openai_body)
 
     async def _handle_buffered(
         self,
@@ -212,7 +213,8 @@ class OllamaHandler(BaseHandler):
                                 if line.startswith("data:"):
                                     data = json.loads(line[5:])
                                     if data.get("type") == "content_block_delta":
-                                        accumulated_text.append(data.get("delta", {}).get("text", ""))
+                                        delta_data = data.get("delta", {})
+                                        accumulated_text.append(delta_data.get("text", "") or delta_data.get("thinking", ""))
                         except Exception:
                             pass
                     yield chunk

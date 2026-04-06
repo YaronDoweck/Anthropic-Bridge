@@ -1,7 +1,8 @@
 """
 RequestLogger: appends JSONL entries for every proxied request/response.
 
-Activated when the OUTPUT_FILE environment variable is set.
+Activated when the OUTPUT_DIR environment variable is set.
+Each session writes to its own <session_id>.jsonl file inside the output directory.
 All I/O is wrapped in try/except so a logging failure never crashes the proxy.
 """
 
@@ -10,39 +11,66 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import threading
 from typing import AsyncGenerator, Optional
 
 logger = logging.getLogger(__name__)
 
 
+def _extract_session_id(request_body: dict) -> str:
+    """Extract session_id from request_body.metadata.user_id JSON string."""
+    try:
+        user_id_str = request_body.get("metadata", {}).get("user_id", "")
+        user_id = json.loads(user_id_str)
+        session_id = user_id.get("session_id", "")
+        if not session_id or not isinstance(session_id, str):
+            return "unknown"
+        # Sanitize: allow only alphanumeric, hyphens, underscores (covers UUIDs)
+        sanitized = re.sub(r'[^a-zA-Z0-9_\-]', '_', session_id)
+        if not sanitized or not sanitized.strip('_'):
+            return "unknown"
+        return sanitized[:200]
+    except Exception:
+        return "unknown"
+
+
 class RequestLogger:
-    def __init__(self, output_path: str) -> None:
-        self._path: Optional[str] = output_path
-        self._lock = threading.Lock()
-        # Validate writability at startup
+    def __init__(self, output_dir: str) -> None:
+        self._dir: Optional[str] = output_dir
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
         try:
-            with open(output_path, "a", encoding="utf-8"):
-                pass
+            os.makedirs(output_dir, exist_ok=True)
+            if not os.access(output_dir, os.W_OK):
+                raise OSError(f"Directory is not writable: {output_dir}")
         except OSError as exc:
             logger.warning(
-                "RequestLogger: cannot write to output file %r: %s — logging disabled",
-                output_path,
+                "RequestLogger: cannot use output directory %r: %s — logging disabled",
+                output_dir,
                 exc,
             )
-            self._path = None
+            self._dir = None
 
-    def log_entry(self, entry: dict) -> None:
-        """Append one JSON line to the output file. Never raises."""
-        if self._path is None:
+    def log_entry(self, entry: dict, session_id: str = "unknown") -> None:
+        """Append one JSON line to the session's output file. Never raises."""
+        if self._dir is None:
             return
         try:
+            path = os.path.join(self._dir, f"{session_id}.jsonl")
             line = json.dumps(entry, ensure_ascii=False)
-            with self._lock:
-                with open(self._path, "a", encoding="utf-8") as fh:
+            with self._get_session_lock(session_id):
+                with open(path, "a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
         except Exception as exc:  # pragma: no cover
             logger.warning("RequestLogger: failed to write log entry: %s", exc)
+
+    def _get_session_lock(self, session_id: str) -> threading.Lock:
+        with self._locks_guard:
+            if session_id not in self._locks:
+                self._locks[session_id] = threading.Lock()
+            return self._locks[session_id]
 
     def log_buffered_response(
         self,
@@ -52,8 +80,11 @@ class RequestLogger:
         response_body: bytes,
         timestamp: str,
         status_code: int = 200,
+        session_id: Optional[str] = None,
     ) -> None:
         """Parse a complete (buffered) Anthropic-format response and log it."""
+        if session_id is None:
+            session_id = _extract_session_id(request_body)
         try:
             parsed = json.loads(response_body)
             content_blocks = parsed.get("content", [])
@@ -85,7 +116,8 @@ class RequestLogger:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "stop_reason": stop_reason,
-            }
+            },
+            session_id=session_id,
         )
 
     async def wrap_streaming_generator(
@@ -95,6 +127,7 @@ class RequestLogger:
         endpoint: str,
         original_generator: AsyncGenerator[bytes, None],
         timestamp: str,
+        session_id: str = "unknown",
     ) -> AsyncGenerator[bytes, None]:
         """
         Async generator that yields every chunk from *original_generator* unchanged,
@@ -165,6 +198,7 @@ class RequestLogger:
                 "model": model,
                 "endpoint": endpoint,
                 "stream": True,
+                "status_code": 200,
                 "request_body": request_body,
                 "response_text": "".join(accumulated_text),
                 "input_tokens": input_tokens,
@@ -172,5 +206,5 @@ class RequestLogger:
                 "stop_reason": stop_reason,
             }
             # Run blocking file I/O in a thread to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.log_entry, entry)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda e=entry: self.log_entry(e, session_id=session_id))

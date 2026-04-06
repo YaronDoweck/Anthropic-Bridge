@@ -14,7 +14,8 @@ class ServerConfig:
     port: int = 8000
     log_level: str = "INFO"
     debug_level: int = 0
-    output_file: str = ""
+    output_dir: str = ""
+    override_model: str = ""
 
 
 @dataclass
@@ -105,8 +106,12 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
                     f"[server] debug_level must be between 0 and 3, got {debug_level}"
                 )
             server.debug_level = debug_level
-        if "output_file" in server_raw:
-            server.output_file = str(server_raw["output_file"])
+        if "output_dir" in server_raw:
+            server.output_dir = str(server_raw["output_dir"])
+        elif "output_file" in server_raw:
+            server.output_dir = str(server_raw["output_file"])
+        if "override_model" in server_raw:
+            server.override_model = str(server_raw["override_model"]).strip()
 
     return ProxyConfig(
         anthropic_url=anthropic_url.rstrip("/"),

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from config import ProxyConfig
 from handlers.anthropic import AnthropicHandler
 from handlers.ollama import OllamaHandler
-from request_logger import RequestLogger
+from request_logger import RequestLogger, _extract_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,14 @@ class ProxyRouter:
                 400, "invalid_request_error", "Missing required field: 'model'"
             )
 
+        # 2b. Apply model override if configured
+        override = self.config.server.override_model
+        if override:
+            original_model = model
+            model = override
+            body["model"] = override
+            logger.debug("OVERRIDE: '%s' -> '%s'", original_model, override)
+
         # 3. Look up ModelConfig (with date-postfix fallback)
         model_config = self.config.models.get(model)
         if model_config is None:
@@ -106,7 +114,8 @@ class ProxyRouter:
         timestamp = datetime.datetime.now().isoformat()
 
         try:
-            response = await handler.handle(request, path, body, model_config)
+            response, sent_body = await handler.handle(request, path, body, model_config)
+            log_body = sent_body if sent_body is not None else body
         except httpx.TimeoutException as exc:
             logger.error("Upstream timeout for model '%s': %s", model, exc)
             return _error_response(
@@ -124,11 +133,13 @@ class ProxyRouter:
             )
 
         if self.request_logger is not None:
+            session_id = _extract_session_id(body)
             if isinstance(response, StreamingResponse):
                 orig_headers = dict(response.headers)
                 response = StreamingResponse(
                     self.request_logger.wrap_streaming_generator(
-                        body, model, endpoint_type, response.body_iterator, timestamp
+                        log_body, model, endpoint_type, response.body_iterator, timestamp,
+                        session_id=session_id
                     ),
                     status_code=response.status_code,
                     media_type=response.media_type,
@@ -136,10 +147,11 @@ class ProxyRouter:
                 )
             else:
                 self.request_logger.log_buffered_response(
-                    body, model, endpoint_type,
+                    log_body, model, endpoint_type,
                     getattr(response, "body", b""),
                     timestamp,
                     status_code=response.status_code,
+                    session_id=session_id,
                 )
 
         if isinstance(response, StreamingResponse):

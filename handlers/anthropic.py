@@ -54,7 +54,7 @@ class AnthropicHandler(BaseHandler):
         path: str,
         body: dict,
         model_config: ModelConfig,
-    ) -> Union[Response, StreamingResponse]:
+    ) -> tuple[Union[Response, StreamingResponse], dict | None]:
         url = f"{self.base_url}/{path}"
         if request.url.query:
             url += f"?{request.url.query}"
@@ -85,9 +85,10 @@ class AnthropicHandler(BaseHandler):
         is_streaming = body.get("stream", False)
 
         if is_streaming:
-            return await self._handle_streaming(request.method, url, headers, body, debug_level)
+            response = await self._handle_streaming(request.method, url, headers, body, debug_level)
         else:
-            return await self._handle_buffered(request.method, url, headers, body, debug_level)
+            response = await self._handle_buffered(request.method, url, headers, body, debug_level)
+        return (response, None)
 
     async def _handle_buffered(
         self,
