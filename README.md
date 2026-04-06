@@ -18,16 +18,18 @@ Claude Code (or any Anthropic-compatible client)
         │
    reads model name
         │
-   ┌────┴────┐
-   ▼         ▼
-Anthropic   Ollama
-  API       (local)
+   ┌────┼────┐
+   ▼    ▼    ▼
+Anth- Open  Ollama
+ropic  AI   (local)
+ API   API
 ```
 
 1. Your client sends an Anthropic-format request with a `model` field.
 2. The proxy looks up the model name in `proxy.config`.
 3. If the model is mapped to `anthropic`, the request is forwarded unchanged to the Anthropic API.
-4. If mapped to `ollama`, the request is converted from Anthropic format to OpenAI format, sent to the local Ollama server, and the response is converted back before being returned to the client.
+4. If mapped to `openai`, the request is converted to OpenAI format, sent to the OpenAI API (or any OpenAI-compatible endpoint), and the response is converted back to Anthropic format.
+5. If mapped to `ollama`, the request is converted from Anthropic format to OpenAI format, sent to the local Ollama server, and the response is converted back before being returned to the client.
 
 Streaming is fully supported for both backends.
 
@@ -68,13 +70,17 @@ port = 8000
 
 [endpoints]
 anthropic_url = "https://api.anthropic.com"
-ollama_url    = "http://127.0.0.1:11434"
+openai_url    = "https://api.openai.com"     # optional
+ollama_url    = "http://127.0.0.1:11434"     # optional
 
 [models."claude-sonnet-4-6"]
 endpoint = "anthropic"
 
 [models."claude-haiku-4-5"]
 endpoint = "anthropic"
+
+[models."gpt-4o"]
+endpoint = "openai"
 
 [models."qwen3:8b"]
 endpoint = "ollama"
@@ -84,6 +90,8 @@ endpoint = "ollama"
 ```
 
 Model names are case-sensitive and must match exactly what your client sends in the `model` field. For Claude Code subagents, set the model name in each subagent's configuration to whatever you define here.
+
+The `openai_url` can point at any OpenAI-compatible API — OpenAI, Azure OpenAI, Together, Groq, a local vLLM server, etc.
 
 ### Using with Claude Code
 
@@ -103,6 +111,7 @@ Copy `.env.example` to `.env` and set your credentials:
 |------------------------|-------------|-------------|
 | `ANTHROPIC_AUTH_TOKEN` | _(unset)_   | Fallback bearer token for Anthropic requests when the client sends no auth headers |
 | `ANTHROPIC_API_KEY`    | _(unset)_   | Fallback API key (lower priority than `ANTHROPIC_AUTH_TOKEN`) |
+| `OPENAI_API_KEY`       | _(unset)_   | API key injected as `Authorization: Bearer` for all `openai` endpoint requests |
 
 
 ## Running
@@ -173,7 +182,7 @@ Edit `proxy.config` only — no code changes needed:
 
 ```toml
 [models."new-model-name"]
-endpoint = "ollama"   # or "anthropic"
+endpoint = "ollama"   # or "anthropic" or "openai"
 ```
 
 For Ollama models, pull the model first: `ollama pull <model-name>`. The proxy checks that all configured Ollama models are available at startup and prompts you to pull any that are missing.

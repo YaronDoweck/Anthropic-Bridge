@@ -222,7 +222,22 @@ _FINISH_REASON_MAP: dict[Optional[str], str] = {
 
 def convert_openai_to_anthropic_response(openai_resp: dict, model: str) -> dict:
     """Convert an OpenAI chat completion response to Anthropic message format."""
-    choice = openai_resp["choices"][0]
+    choices = openai_resp.get("choices") or []
+    if not choices:
+        return {
+            "id": openai_resp.get("id", "msg_unknown"),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": ""}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": openai_resp.get("usage", {}).get("prompt_tokens", 0),
+                "output_tokens": openai_resp.get("usage", {}).get("completion_tokens", 0),
+            },
+        }
+    choice = choices[0]
     finish_reason = choice.get("finish_reason")
     stop_reason = _FINISH_REASON_MAP.get(finish_reason, "end_turn")
 

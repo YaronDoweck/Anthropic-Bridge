@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from config import ProxyConfig
 from handlers.anthropic import AnthropicHandler
 from handlers.ollama import OllamaHandler
+from handlers.openai import OpenAIHandler
 from request_logger import RequestLogger, RawLogger, _extract_session_id
 
 logger = logging.getLogger(__name__)
@@ -48,15 +49,22 @@ class ProxyRouter:
         self.config = config
         self.request_logger = request_logger
         self.raw_logger = raw_logger
-        self.handlers = {
+        self.handlers: dict = {
             "anthropic": AnthropicHandler(
                 base_url=config.anthropic_url,
                 http_client=http_client,
                 auth_token=os.getenv("ANTHROPIC_AUTH_TOKEN"),
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
             ),
-            "ollama": OllamaHandler(config.ollama_url, http_client),
         }
+        if config.ollama_url:
+            self.handlers["ollama"] = OllamaHandler(config.ollama_url, http_client)
+        if config.openai_url:
+            self.handlers["openai"] = OpenAIHandler(
+                base_url=config.openai_url,
+                http_client=http_client,
+                api_key=os.getenv("OPENAI_API_KEY"),
+            )
 
     async def route(
         self, request: Request, path: str

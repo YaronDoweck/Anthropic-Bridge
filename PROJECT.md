@@ -1,6 +1,6 @@
 # Project Overview: LLM Proxy
 
-A FastAPI proxy that accepts **Anthropic-format API requests** and routes them to either the **Anthropic API** (pass-through) or a local **Ollama instance** (native Anthropic format), based on the model name in the request.
+A FastAPI proxy that accepts **Anthropic-format API requests** and routes them to the **Anthropic API** (pass-through), a local **Ollama instance** (native Anthropic format), or an **OpenAI-compatible API** (with format conversion), based on the model name in the request.
 
 ---
 
@@ -15,15 +15,17 @@ Client (Anthropic format)
         ▼
    router.py          Parses body → extracts model → looks up config → dispatches
         │
-   ┌────┴────┐
-   ▼         ▼
-handlers/   handlers/
-anthropic   ollama
-.py         .py
-   │         │
-   ▼         ▼
-Anthropic  Ollama
-  API      (local, Anthropic-compatible)
+   ┌────┼────────────┐
+   ▼    ▼            ▼
+handlers/ handlers/  handlers/
+anthropic ollama     openai
+.py       .py        .py
+   │       │            │
+   ▼       ▼            ▼
+Anthropic Ollama      OpenAI-compatible
+  API    (local,       API (converts
+        Anthropic-     Anthropic↔OpenAI
+        compatible)    format)
 ```
 
 ---
@@ -42,7 +44,8 @@ Anthropic  Ollama
 | `handlers/base.py` | Abstract `BaseHandler` interface |
 | `handlers/anthropic.py` | Pass-through to Anthropic API, injects fallback auth |
 | `handlers/ollama.py` | Forwards to Ollama Anthropic-compatible endpoint; handles system-reminder extraction |
-| `converters/anthropic_openai.py` | Pure functions: Anthropic↔OpenAI (used by tests only) |
+| `handlers/openai.py` | Converts Anthropic requests to OpenAI format, forwards to OpenAI-compatible API, converts response back |
+| `converters/anthropic_openai.py` | Pure conversion functions: Anthropic↔OpenAI request/response/streaming |
 | `tests/conftest.py` | Pytest fixtures: `proxy_config`, `test_port`, `running_server` |
 | `tests/test_converters.py` | Unit tests for converters (no network) |
 | `tests/test_router.py` | Router tests via TestClient with mocked httpx |
@@ -66,12 +69,16 @@ debug_level = 0
 [endpoints]
 anthropic_url = "https://api.anthropic.com"
 ollama_url = "http://127.0.0.1:11434"
+openai_url = "https://api.openai.com"
 
 [models."claude-3-haiku-20240307"]
 endpoint = "anthropic"
 
 [models."llama3.2"]
 endpoint = "ollama"
+
+[models."gpt-4o"]
+endpoint = "openai"
 ```
 
 The `[server]` section is fully optional — all fields have defaults. Each model is a **TOML table** (not a simple string) so future fields can be added without breaking existing entries. Model names are **exact case-sensitive** matches against the `model` field in incoming requests.
@@ -97,8 +104,11 @@ Keep this file for private credentials only — do not commit it.
 |----------|-------------|
 | `ANTHROPIC_AUTH_TOKEN` | Fallback bearer token (injected if client sends no auth) |
 | `ANTHROPIC_API_KEY` | Fallback API key (injected if client sends no auth) |
+| `OPENAI_API_KEY` | API key injected as `Authorization: Bearer` for OpenAI handler |
 
 **Auth priority** (Anthropic handler): incoming `x-api-key` > incoming `Authorization` > `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_API_KEY`
+
+**Auth** (OpenAI handler): `OPENAI_API_KEY` from `.env` is always injected as `Authorization: Bearer <key>`, overriding any client-supplied header.
 
 ---
 
@@ -110,7 +120,8 @@ Keep this file for private credentials only — do not commit it.
 4. Dispatches to handler based on `model_config.endpoint`
 5. **Anthropic handler**: forwards all headers as-is (except hop-by-hop), injects fallback auth if needed, streams or buffers Anthropic SSE/JSON unchanged
 6. **Ollama handler**: strips non-essential headers, applies system-reminder handling if configured, forwards request unchanged to Ollama's Anthropic-compatible endpoint, streams or buffers response unchanged
-7. All errors returned in Anthropic error schema: `{"type": "error", "error": {"type": "...", "message": "..."}}`
+7. **OpenAI handler**: allowlists headers (content-type, accept, user-agent, accept-encoding only), injects `Authorization: Bearer` from `OPENAI_API_KEY`, converts request body from Anthropic to OpenAI format (`convert_anthropic_to_openai_request`), always POSTs to `{openai_url}/v1/chat/completions`. Non-streaming: converts OpenAI JSON response back to Anthropic format (`convert_openai_to_anthropic_response`). Streaming: pipes OpenAI SSE through `convert_openai_stream_to_anthropic` and yields Anthropic SSE events. Error responses (non-200) are mapped to Anthropic error schema: 401→authentication_error, 429→rate_limit_error, 400→invalid_request_error, 5xx→api_error.
+8. All errors returned in Anthropic error schema: `{"type": "error", "error": {"type": "...", "message": "..."}}`
 
 ---
 

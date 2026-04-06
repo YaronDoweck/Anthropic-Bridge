@@ -21,7 +21,7 @@ class ServerConfig:
 
 @dataclass
 class ModelConfig:
-    endpoint: str  # "anthropic" | "ollama"
+    endpoint: str  # "anthropic" | "ollama" | "openai"
     claude_system_instructions: str = "passthrough"
     omit_claude_main_description: bool = True
 
@@ -29,8 +29,9 @@ class ModelConfig:
 @dataclass
 class ProxyConfig:
     anthropic_url: str
-    ollama_url: str
-    models: dict[str, ModelConfig]
+    ollama_url: str = ""
+    openai_url: str = ""
+    models: dict[str, ModelConfig] = field(default_factory=dict)
     server: ServerConfig = field(default_factory=ServerConfig)
 
 
@@ -53,12 +54,10 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
     except Exception as exc:
         raise RuntimeError(f"Failed to parse config file '{path}': {exc}") from exc
 
-    try:
-        endpoints = raw["endpoints"]
-        anthropic_url = endpoints["anthropic_url"]
-        ollama_url = endpoints["ollama_url"]
-    except KeyError as exc:
-        raise RuntimeError(f"Config missing required key under [endpoints]: {exc}") from exc
+    endpoints = raw.get("endpoints", {})
+    anthropic_url = endpoints.get("anthropic_url", "")
+    ollama_url = endpoints.get("ollama_url", "")
+    openai_url = endpoints.get("openai_url", "")
 
     models_raw = raw.get("models", {})
     models: dict[str, ModelConfig] = {}
@@ -116,9 +115,25 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
         if "override_model" in server_raw:
             server.override_model = str(server_raw["override_model"]).strip()
 
+    # Validate that each model's endpoint has a corresponding non-empty URL
+    _endpoint_urls = {
+        "anthropic": anthropic_url,
+        "ollama": ollama_url,
+        "openai": openai_url,
+    }
+    for model_name, model_cfg in models.items():
+        ep = model_cfg.endpoint
+        url = _endpoint_urls.get(ep, "")
+        if not url:
+            raise RuntimeError(
+                f"Model '{model_name}' uses endpoint '{ep}' but no URL is configured "
+                f"for that endpoint. Add '{ep}_url' under [endpoints] in proxy.config."
+            )
+
     return ProxyConfig(
         anthropic_url=anthropic_url.rstrip("/"),
         ollama_url=ollama_url.rstrip("/"),
+        openai_url=openai_url.rstrip("/"),
         models=models,
         server=server,
     )
