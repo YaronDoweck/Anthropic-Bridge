@@ -8,6 +8,13 @@ The practical payoff: you can assign expensive Anthropic models only to the suba
 
 It also gives you a clean place to add cross-cutting concerns. The proxy logs every request and response to JSONL, so you can audit exactly what your subagents are doing. There is a built-in summarizer that reads those logs and produces a readable summary using a local model. Token usage stats are tracked per model, so you can see at a glance where costs are accumulating.
 
+## Supported Endpoints
+- Anthropic  
+- OpenAI  
+- Ollama  
+  
+Comming soon: Gemini, LMstudio
+
 ## How It Works
 
 ```

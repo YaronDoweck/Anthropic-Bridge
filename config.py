@@ -24,6 +24,7 @@ class ModelConfig:
     endpoint: str  # "anthropic" | "ollama" | "openai"
     claude_system_instructions: str = "passthrough"
     omit_claude_main_description: bool = True
+    ollama_format: str = "anthropic"  # "anthropic" | "openai"
 
 
 @dataclass
@@ -79,10 +80,25 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
                 "when claude_system_instructions='passthrough'",
                 model_name,
             )
+        ollama_format = model_data.get("ollama_format", "anthropic")
+        _VALID_OLLAMA_FORMATS = ("anthropic", "openai")
+        if ollama_format not in _VALID_OLLAMA_FORMATS:
+            raise RuntimeError(
+                f"Model '{model_name}': ollama_format must be one of "
+                f"{_VALID_OLLAMA_FORMATS}, got '{ollama_format}'"
+            )
+        if "ollama_format" in model_data and model_data["endpoint"] != "ollama":
+            logger.warning(
+                "Model '%s': ollama_format is set but has no effect "
+                "when endpoint is '%s' (only applies to 'ollama' endpoint)",
+                model_name,
+                model_data["endpoint"],
+            )
         models[model_name] = ModelConfig(
             endpoint=model_data["endpoint"],
             claude_system_instructions=claude_system_instructions,
             omit_claude_main_description=model_data.get("omit_claude_main_description", True),
+            ollama_format=ollama_format,
         )
 
     server = ServerConfig()

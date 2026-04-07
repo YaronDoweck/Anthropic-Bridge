@@ -173,17 +173,39 @@ class TestInvalidJson:
         assert body["error"]["type"] == "invalid_request_error"
 
 
+def _anthropic_ok_response(content: str = "Hello!") -> MagicMock:
+    """Build a fake httpx.Response that looks like a valid Anthropic message response."""
+    resp = MagicMock()
+    resp.status_code = 200
+    payload = {
+        "id": "msg_test123",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": content}],
+        "model": "gemma4:26b",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 3},
+    }
+    resp.content = json.dumps(payload).encode()
+    resp.json.return_value = payload
+    resp.headers = {"content-type": "application/json"}
+    return resp
+
+
 class TestValidOllamaRequest:
     def test_known_ollama_model_routed_successfully(self):
         """
-        A valid request for a known Ollama model should be forwarded and the
-        response converted back to Anthropic format (type='message').
+        A valid request for a known Ollama model (anthropic format) should be
+        forwarded and the response passed through in Anthropic format (type='message').
+        The mock returns an Anthropic-shaped payload because the anthropic-format
+        handler does not convert - it passes the upstream response through as-is.
         """
-        with _make_client() as client:
+        anthropic_resp = _anthropic_ok_response("Hello!")
+        with _make_client(mock_http_response=anthropic_resp) as client:
             resp = client.post(
                 "/v1/messages",
                 json={
-                    "model": "qwen3.5:9b",
+                    "model": "gemma4:26b",
                     "messages": [{"role": "user", "content": "Say hello"}],
                     "max_tokens": 100,
                 },
@@ -197,14 +219,15 @@ class TestValidOllamaRequest:
 
     def test_known_ollama_model_stop_sequences_forwarded(self):
         """
-        stop_sequences in the Anthropic request should be converted to 'stop'
-        before being sent to Ollama (we verify the router doesn't reject the field).
+        stop_sequences in the Anthropic request should be forwarded to Ollama
+        (we verify the router doesn't reject the field and returns 200).
         """
-        with _make_client() as client:
+        anthropic_resp = _anthropic_ok_response("ok")
+        with _make_client(mock_http_response=anthropic_resp) as client:
             resp = client.post(
                 "/v1/messages",
                 json={
-                    "model": "qwen3.5:9b",
+                    "model": "gemma4:26b",
                     "messages": [{"role": "user", "content": "hi"}],
                     "stop_sequences": ["END"],
                     "max_tokens": 50,
@@ -381,3 +404,228 @@ class TestOverrideModel:
         body = resp.json()
         assert body["type"] == "error"
         assert body["error"]["type"] == "invalid_request_error"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for ollama_format tests
+# ---------------------------------------------------------------------------
+
+import tempfile
+
+
+def _write_temp_config(content: str) -> str:
+    """Write a TOML config to a temp file and return its path."""
+    f = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".toml", delete=False, encoding="utf-8"
+    )
+    f.write(content)
+    f.flush()
+    f.close()
+    return f.name
+
+
+@contextmanager
+def _make_client_with_config(config_content: str, mock_http_response=None):
+    """
+    Like _make_client but loads config from the given TOML string rather
+    than from the real proxy.config.
+    """
+    from config import load_config
+
+    config_path = _write_temp_config(config_content)
+    try:
+        loaded_config = load_config(config_path)
+    finally:
+        os.unlink(config_path)
+
+    if mock_http_response is None:
+        mock_http_response = _openai_ok_response()
+
+    mock_http_client = _build_mock_http_client(mock_http_response)
+
+    import server as server_module
+
+    with (
+        patch.object(server_module, "config", loaded_config),
+        patch("server.run_startup_checks", return_value=None),
+        patch("server.httpx.AsyncClient", return_value=mock_http_client),
+    ):
+        with TestClient(server_module.app, raise_server_exceptions=False) as client:
+            yield client, mock_http_client
+
+
+# ---------------------------------------------------------------------------
+# Tests: ollama_format config validation
+# ---------------------------------------------------------------------------
+
+_BASE_CONFIG = """
+[endpoints]
+anthropic_url = "https://api.anthropic.com"
+ollama_url = "http://127.0.0.1:11434"
+openai_url = "https://api.openai.com"
+"""
+
+
+class TestOllamaFormatConfig:
+    def test_ollama_format_defaults_to_anthropic(self):
+        """ModelConfig.ollama_format must default to 'anthropic' when not specified."""
+        from config import load_config
+
+        config_toml = _BASE_CONFIG + """
+[models."mymodel"]
+endpoint = "ollama"
+"""
+        config_path = _write_temp_config(config_toml)
+        try:
+            cfg = load_config(config_path)
+        finally:
+            os.unlink(config_path)
+
+        assert cfg.models["mymodel"].ollama_format == "anthropic"
+
+    def test_ollama_format_openai_accepted(self):
+        """ollama_format = 'openai' must be accepted without error."""
+        from config import load_config
+
+        config_toml = _BASE_CONFIG + """
+[models."mymodel"]
+endpoint = "ollama"
+ollama_format = "openai"
+"""
+        config_path = _write_temp_config(config_toml)
+        try:
+            cfg = load_config(config_path)
+        finally:
+            os.unlink(config_path)
+
+        assert cfg.models["mymodel"].ollama_format == "openai"
+
+    def test_ollama_format_invalid_raises_runtime_error(self):
+        """An unrecognised ollama_format value must raise RuntimeError."""
+        from config import load_config
+
+        config_toml = _BASE_CONFIG + """
+[models."mymodel"]
+endpoint = "ollama"
+ollama_format = "graphql"
+"""
+        config_path = _write_temp_config(config_toml)
+        try:
+            with pytest.raises(RuntimeError, match="ollama_format"):
+                load_config(config_path)
+        finally:
+            os.unlink(config_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests: ollama_format = "openai" handler behaviour
+# ---------------------------------------------------------------------------
+
+_OLLAMA_OPENAI_FORMAT_CONFIG = _BASE_CONFIG + """
+[models."myollama"]
+endpoint = "ollama"
+ollama_format = "openai"
+"""
+
+
+class TestOllamaOpenAIFormat:
+    def test_posts_to_chat_completions_not_messages(self):
+        """
+        When ollama_format='openai', the handler must POST to
+        /v1/chat/completions, not /v1/messages.
+        """
+        captured_calls: list = []
+
+        with _make_client_with_config(_OLLAMA_OPENAI_FORMAT_CONFIG) as (client, mock_http_client):
+            original_request = mock_http_client.request
+
+            async def _capture(*args, **kwargs):
+                captured_calls.append(kwargs)
+                return await original_request(*args, **kwargs)
+
+            mock_http_client.request = _capture
+
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "myollama",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                },
+            )
+
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert len(captured_calls) == 1, "Expected exactly one upstream call"
+        url_called = captured_calls[0].get("url", "")
+        assert "/v1/chat/completions" in url_called, (
+            f"Expected URL to contain /v1/chat/completions, got: {url_called!r}"
+        )
+        assert "/v1/messages" not in url_called, (
+            f"URL must not contain /v1/messages when ollama_format='openai', got: {url_called!r}"
+        )
+
+    def test_response_converted_to_anthropic_format(self):
+        """
+        When ollama_format='openai', the OpenAI chat completion response from
+        the upstream must be converted back into the Anthropic message schema.
+        """
+        openai_response = _openai_ok_response("Hello from openai-format ollama!")
+
+        with _make_client_with_config(
+            _OLLAMA_OPENAI_FORMAT_CONFIG,
+            mock_http_response=openai_response,
+        ) as (client, _):
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "myollama",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                },
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # Must be converted to Anthropic message schema
+        assert body.get("type") == "message", f"Expected type='message', got: {body}"
+        assert body.get("role") == "assistant"
+        assert isinstance(body.get("content"), list)
+        assert len(body["content"]) >= 1
+        assert body["content"][0].get("type") == "text"
+        assert "Hello from openai-format ollama!" in body["content"][0].get("text", "")
+
+    def test_anthropic_format_uses_messages_endpoint(self):
+        """
+        Sanity-check: when ollama_format is left at the default 'anthropic',
+        the handler must NOT post to /v1/chat/completions.
+        """
+        _OLLAMA_ANTHROPIC_FORMAT_CONFIG = _BASE_CONFIG + """
+[models."myollama"]
+endpoint = "ollama"
+ollama_format = "anthropic"
+"""
+        captured_calls: list = []
+
+        with _make_client_with_config(_OLLAMA_ANTHROPIC_FORMAT_CONFIG) as (client, mock_http_client):
+            original_request = mock_http_client.request
+
+            async def _capture(*args, **kwargs):
+                captured_calls.append(kwargs)
+                return await original_request(*args, **kwargs)
+
+            mock_http_client.request = _capture
+
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "myollama",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 50,
+                },
+            )
+
+        assert len(captured_calls) == 1
+        url_called = captured_calls[0].get("url", "")
+        assert "/v1/chat/completions" not in url_called, (
+            f"anthropic format should not call /v1/chat/completions, got: {url_called!r}"
+        )
