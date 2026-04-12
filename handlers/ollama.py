@@ -3,10 +3,14 @@ Ollama handler.
 
 Forwards incoming Anthropic-format requests directly to Ollama's
 Anthropic-compatible endpoint, with optional system-reminder extraction.
+Supports a sticky fallback URL: if the primary Ollama is unreachable the
+handler switches to the fallback and a background health-checker restores
+traffic to the primary once it recovers.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -14,6 +18,7 @@ import logging
 import uuid
 from typing import Optional, Union
 
+import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -51,6 +56,75 @@ def _anthropic_error_response(status_code: int, message: str) -> JSONResponse:
 
 
 class OllamaHandler(BaseHandler):
+    def __init__(
+        self,
+        base_url: str,
+        http_client: httpx.AsyncClient,
+        fallback_url: Optional[str] = None,
+    ) -> None:
+        self._primary_url = base_url.rstrip("/")
+        self._fallback_url = fallback_url.rstrip("/") if fallback_url else None
+        self._using_fallback = False
+        self._health_task: Optional[asyncio.Task] = None
+        self.client = http_client
+        # Note: do NOT call super().__init__() — base_url is a property here
+
+    @property
+    def base_url(self) -> str:  # type: ignore[override]
+        if self._using_fallback and self._fallback_url:
+            return self._fallback_url
+        return self._primary_url
+
+    def _mark_fallback(self, reason: str) -> None:
+        if not self._using_fallback:
+            logger.warning(
+                "Ollama primary %r unavailable (%s), switching to fallback %r",
+                self._primary_url, reason, self._fallback_url,
+            )
+            self._using_fallback = True
+
+    def _mark_primary(self) -> None:
+        if self._using_fallback:
+            logger.info(
+                "Ollama primary %r recovered, switching back from fallback",
+                self._primary_url,
+            )
+            self._using_fallback = False
+
+    async def start_health_checker(self, interval_s: float = 10.0) -> None:
+        if self._health_task is not None:
+            return  # already running
+        self._health_task = asyncio.create_task(
+            self._health_check_loop(interval_s)
+        )
+
+    async def stop_health_checker(self) -> None:
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+            self._health_task = None
+
+    async def _health_check_loop(self, interval_s: float) -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            if not self._using_fallback:
+                continue  # primary is fine, nothing to check
+            if await self._probe_primary():
+                self._mark_primary()
+
+    async def _probe_primary(self) -> bool:
+        try:
+            resp = await self.client.get(
+                f"{self._primary_url}/api/version",
+                timeout=2.0,
+            )
+            return resp.status_code < 500
+        except Exception:
+            return False
+
     async def handle(
         self,
         request: Request,
@@ -58,10 +132,6 @@ class OllamaHandler(BaseHandler):
         body: dict,
         model_config: ModelConfig,
     ) -> tuple[Union[Response, StreamingResponse], Optional[dict]]:
-        url = f"{self.base_url}/{path}"
-        if request.url.query:
-            url += f"?{request.url.query}"
-
         # Forward only safe headers
         headers = {
             k: v
@@ -117,30 +187,46 @@ class OllamaHandler(BaseHandler):
                 )
 
         is_streaming = body.get("stream", False)
+        original_model = body.get("model", "")
+
+        sent_body: Optional[dict]
+
+        async def _dispatch() -> tuple[Union[Response, StreamingResponse], Optional[dict]]:
+            if model_config.ollama_format == "openai":
+                openai_url = f"{self.base_url}/v1/chat/completions"
+                openai_body = convert_anthropic_to_openai_request(send_body)
+                nonlocal sent_body
+                sent_body = openai_body
+                if debug_level == 1:
+                    logger.debug("OLLAMA OPENAI REQUEST: %s", format_body_short(openai_body))
+                elif debug_level >= 2:
+                    logger.debug(
+                        "OLLAMA OPENAI REQUEST:\n%s",
+                        json.dumps(openai_body, indent=2, ensure_ascii=False),
+                    )
+                if is_streaming:
+                    response = await self._handle_streaming_openai(openai_url, headers, openai_body, original_model, debug_level)
+                else:
+                    response = await self._handle_buffered_openai(openai_url, headers, openai_body, original_model, debug_level)
+                return (response, sent_body)
+            else:
+                url = f"{self.base_url}/{path}"
+                if request.url.query:
+                    url += f"?{request.url.query}"
+                if is_streaming:
+                    response = await self._handle_streaming(url, headers, send_body, debug_level)
+                else:
+                    response = await self._handle_buffered(url, headers, send_body, debug_level)
+                return (response, send_body)
 
         sent_body = send_body
-        if model_config.ollama_format == "openai":
-            openai_url = f"{self.base_url}/v1/chat/completions"
-            original_model = body.get("model", "")
-            openai_body = convert_anthropic_to_openai_request(send_body)
-            sent_body = openai_body
-            if debug_level == 1:
-                logger.debug("OLLAMA OPENAI REQUEST: %s", format_body_short(openai_body))
-            elif debug_level >= 2:
-                logger.debug(
-                    "OLLAMA OPENAI REQUEST:\n%s",
-                    json.dumps(openai_body, indent=2, ensure_ascii=False),
-                )
-            if is_streaming:
-                response = await self._handle_streaming_openai(openai_url, headers, openai_body, original_model, debug_level)
-            else:
-                response = await self._handle_buffered_openai(openai_url, headers, openai_body, original_model, debug_level)
-        else:
-            if is_streaming:
-                response = await self._handle_streaming(url, headers, send_body, debug_level)
-            else:
-                response = await self._handle_buffered(url, headers, send_body, debug_level)
-        return (response, sent_body)
+        try:
+            return await _dispatch()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            if self._fallback_url and not self._using_fallback:
+                self._mark_fallback(str(exc))
+                return await _dispatch()
+            raise
 
     async def _handle_buffered(
         self,
@@ -187,15 +273,26 @@ class OllamaHandler(BaseHandler):
         body: dict,
         debug_level: int,
     ) -> StreamingResponse:
-        async def _stream_generator():
+        # Eagerly open the upstream connection — ConnectError/ConnectTimeout raises here,
+        # not inside the generator, so handle()'s failover logic can catch it.
+        req = self.client.build_request("POST", url, headers=headers, content=json.dumps(body).encode())
+        response = await self.client.send(req, stream=True)
+
+        # Check HTTP status before entering the streaming generator
+        if response.status_code != 200:
+            error_body = await response.aread()
+            await response.aclose()
+            try:
+                err = json.loads(error_body)
+                message = err.get("error", {}).get("message", error_body.decode())
+            except Exception:
+                message = error_body.decode()
+            return _anthropic_error_response(response.status_code, message)
+
+        async def _gen():
             accumulated_text = []
-            async with self.client.stream(
-                method="POST",
-                url=url,
-                headers=headers,
-                content=json.dumps(body).encode(),
-            ) as resp:
-                async for chunk in resp.aiter_bytes():
+            try:
+                async for chunk in response.aiter_bytes():
                     if debug_level >= 1:
                         try:
                             for line in chunk.decode().splitlines():
@@ -207,18 +304,24 @@ class OllamaHandler(BaseHandler):
                         except Exception:
                             pass
                     yield chunk
-            if debug_level >= 1 and accumulated_text:
-                text = "".join(accumulated_text)
-                if debug_level == 1:
-                    preview = text[:80].replace("\n", " ")
-                    logger.debug("OLLAMA RESPONSE [stream]: %r", preview)
-                else:
-                    logger.debug("OLLAMA RESPONSE [stream]:\n%s", text)
+                if debug_level >= 1 and accumulated_text:
+                    text = "".join(accumulated_text)
+                    if debug_level == 1:
+                        preview = text[:80].replace("\n", " ")
+                        logger.debug("OLLAMA RESPONSE [stream]: %r", preview)
+                    else:
+                        logger.debug("OLLAMA RESPONSE [stream]:\n%s", text)
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.StreamError) as exc:
+                logger.error("Ollama stream disconnected: %s", exc)
+                err = {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": f"Upstream disconnected: {type(exc).__name__}"},
+                }
+                yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
+            finally:
+                await response.aclose()
 
-        return StreamingResponse(
-            _stream_generator(),
-            media_type="text/event-stream",
-        )
+        return StreamingResponse(_gen(), media_type="text/event-stream")
 
     async def _handle_buffered_openai(
         self,
@@ -274,29 +377,26 @@ class OllamaHandler(BaseHandler):
     ) -> StreamingResponse:
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+        # Eagerly open the upstream connection — ConnectError/ConnectTimeout raises here,
+        # not inside the generator, so handle()'s failover logic can catch it.
+        req = self.client.build_request("POST", url, headers=headers, content=json.dumps(openai_body).encode())
+        response = await self.client.send(req, stream=True)
+
+        # Check HTTP status before entering the streaming generator
+        if response.status_code != 200:
+            error_body = await response.aread()
+            await response.aclose()
+            try:
+                err = json.loads(error_body)
+                message = err.get("error", {}).get("message", error_body.decode())
+            except Exception:
+                message = error_body.decode()
+            return _anthropic_error_response(response.status_code, message)
+
         async def _stream_generator():
             accumulated_text = []
-            async with self.client.stream(
-                method="POST",
-                url=url,
-                headers=headers,
-                content=json.dumps(openai_body).encode(),
-            ) as resp:
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    try:
-                        err = json.loads(error_body)
-                        message = err.get("error", {}).get("message", error_body.decode())
-                    except Exception:
-                        message = error_body.decode()
-                    error_type = _STATUS_TO_ANTHROPIC_ERROR.get(
-                        resp.status_code, "api_error" if resp.status_code >= 500 else "invalid_request_error"
-                    )
-                    error_dict = {"type": "error", "error": {"type": error_type, "message": message}}
-                    yield f"event: error\ndata: {json.dumps(error_dict)}\n\n".encode()
-                    return
-
-                async for chunk in convert_openai_stream_to_anthropic(resp, original_model, message_id):
+            try:
+                async for chunk in convert_openai_stream_to_anthropic(response, original_model, message_id):
                     if debug_level >= 1:
                         try:
                             line = chunk.decode()
@@ -306,14 +406,22 @@ class OllamaHandler(BaseHandler):
                         except Exception:
                             pass
                     yield chunk
-
-            if debug_level >= 1 and accumulated_text:
-                text = "".join(accumulated_text)
-                if debug_level == 1:
-                    preview = text[:80].replace("\n", " ")
-                    logger.debug("OLLAMA OPENAI RESPONSE [stream]: %r", preview)
-                else:
-                    logger.debug("OLLAMA OPENAI RESPONSE [stream]:\n%s", text)
+                if debug_level >= 1 and accumulated_text:
+                    text = "".join(accumulated_text)
+                    if debug_level == 1:
+                        preview = text[:80].replace("\n", " ")
+                        logger.debug("OLLAMA OPENAI RESPONSE [stream]: %r", preview)
+                    else:
+                        logger.debug("OLLAMA OPENAI RESPONSE [stream]:\n%s", text)
+            except (httpx.ReadError, httpx.RemoteProtocolError, httpx.StreamError) as exc:
+                logger.error("Ollama OpenAI stream disconnected: %s", exc)
+                err_dict = {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": f"Upstream disconnected: {type(exc).__name__}"},
+                }
+                yield f"event: error\ndata: {json.dumps(err_dict)}\n\n".encode()
+            finally:
+                await response.aclose()
 
         return StreamingResponse(
             _stream_generator(),

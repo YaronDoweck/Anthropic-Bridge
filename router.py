@@ -5,6 +5,7 @@ and dispatches to the appropriate handler.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -49,6 +50,7 @@ class ProxyRouter:
         self.config = config
         self.request_logger = request_logger
         self.raw_logger = raw_logger
+        self._config_lock = asyncio.Lock()
         self.handlers: dict = {
             "anthropic": AnthropicHandler(
                 base_url=config.anthropic_url,
@@ -58,13 +60,85 @@ class ProxyRouter:
             ),
         }
         if config.ollama_url:
-            self.handlers["ollama"] = OllamaHandler(config.ollama_url, http_client)
+            self.handlers["ollama"] = OllamaHandler(
+                config.ollama_url,
+                http_client,
+                fallback_url=config.ollama_fallback_url or None,
+            )
         if config.openai_url:
             self.handlers["openai"] = OpenAIHandler(
                 base_url=config.openai_url,
                 http_client=http_client,
                 api_key=os.getenv("OPENAI_API_KEY"),
             )
+
+    async def apply_config(
+        self, new_config: ProxyConfig, http_client: httpx.AsyncClient
+    ) -> None:
+        """Hot-reload config and rebuild handlers. Called from ConfigWatcher."""
+        # 1. Build new_handlers outside the lock (only reads config).
+        new_handlers: dict = {
+            "anthropic": AnthropicHandler(
+                base_url=new_config.anthropic_url,
+                http_client=http_client,
+                auth_token=os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                api_key=os.getenv("ANTHROPIC_API_KEY"),
+            ),
+        }
+
+        replacing_ollama = False
+        new_ollama_handler = None
+        if new_config.ollama_url:
+            current_ollama = self.handlers.get("ollama")
+            new_ollama_primary = new_config.ollama_url
+            new_ollama_fallback = new_config.ollama_fallback_url or None
+
+            # Reuse the existing OllamaHandler instance if URLs are unchanged
+            # to preserve health-check state
+            if (
+                isinstance(current_ollama, OllamaHandler)
+                and current_ollama._primary_url == new_ollama_primary
+                and current_ollama._fallback_url == new_ollama_fallback
+            ):
+                new_handlers["ollama"] = current_ollama
+            else:
+                new_ollama_handler = OllamaHandler(
+                    new_ollama_primary, http_client, fallback_url=new_ollama_fallback
+                )
+                # 2. Start the new handler's health-checker BEFORE acquiring the lock.
+                if new_ollama_fallback:
+                    await new_ollama_handler.start_health_checker()
+                new_handlers["ollama"] = new_ollama_handler
+                replacing_ollama = True
+
+        if new_config.openai_url:
+            new_handlers["openai"] = OpenAIHandler(
+                base_url=new_config.openai_url,
+                http_client=http_client,
+                api_key=os.getenv("OPENAI_API_KEY"),
+            )
+
+        # 3. Under the lock, snapshot the old ollama handler then commit the new state.
+        old_ollama = None
+        async with self._config_lock:
+            if replacing_ollama:
+                old_ollama = self.handlers.get("ollama")
+            self.handlers = new_handlers
+            self.config = new_config
+
+        # 4. AFTER releasing the lock, stop the old health-checker if it was replaced.
+        if old_ollama is not None and isinstance(old_ollama, OllamaHandler):
+            try:
+                await old_ollama.stop_health_checker()
+            except Exception as exc:
+                logger.warning("ProxyRouter: error stopping old OllamaHandler health checker: %s", exc)
+
+        if new_config.server.override_model:
+            logger.warning(
+                "OVERRIDE MODE ACTIVE: all requests will use model '%s'",
+                new_config.server.override_model,
+            )
+        logger.info("ProxyRouter: config applied (hot-swap)")
 
     async def route(
         self, request: Request, path: str
@@ -80,6 +154,11 @@ class ProxyRouter:
             logger.warning("Invalid JSON body: %s", exc)
             return _error_response(400, "invalid_request_error", f"Invalid JSON body: {exc}")
 
+        # Snapshot config and handlers to avoid torn reads during a concurrent reload
+        async with self._config_lock:
+            cfg = self.config
+            handlers = self.handlers
+
         # 2. Extract model field
         model = body.get("model")
         if not model:
@@ -88,7 +167,7 @@ class ProxyRouter:
             )
 
         # 2b. Apply model override if configured
-        override = self.config.server.override_model
+        override = cfg.server.override_model
         if override:
             original_model = model
             model = override
@@ -96,11 +175,11 @@ class ProxyRouter:
             logger.debug("OVERRIDE: '%s' -> '%s'", original_model, override)
 
         # 3. Look up ModelConfig (with date-postfix fallback)
-        model_config = self.config.models.get(model)
+        model_config = cfg.models.get(model)
         if model_config is None:
             stripped = _strip_date_postfix(model)
             if stripped is not None:
-                model_config = self.config.models.get(stripped)
+                model_config = cfg.models.get(stripped)
                 if model_config is not None:
                     logger.info("Model '%s' matched config key '%s' (date-postfix stripped)", model, stripped)
         if model_config is None:
@@ -108,12 +187,12 @@ class ProxyRouter:
                 400,
                 "invalid_request_error",
                 f"Model '{model}' is not configured. "
-                f"Available models: {', '.join(sorted(self.config.models))}",
+                f"Available models: {', '.join(sorted(cfg.models))}",
             )
 
         # 4. Dispatch to handler
         endpoint_type = model_config.endpoint
-        handler = self.handlers.get(endpoint_type)
+        handler = handlers.get(endpoint_type)
         if handler is None:
             logger.error("No handler registered for endpoint type '%s'", endpoint_type)
             return _error_response(

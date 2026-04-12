@@ -31,6 +31,7 @@ class ModelConfig:
 class ProxyConfig:
     anthropic_url: str
     ollama_url: str = ""
+    ollama_fallback_url: str = ""
     openai_url: str = ""
     models: dict[str, ModelConfig] = field(default_factory=dict)
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -58,6 +59,7 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
     endpoints = raw.get("endpoints", {})
     anthropic_url = endpoints.get("anthropic_url", "")
     ollama_url = endpoints.get("ollama_url", "")
+    ollama_fallback_url = endpoints.get("ollama_fallback_url", "")
     openai_url = endpoints.get("openai_url", "")
 
     models_raw = raw.get("models", {})
@@ -131,6 +133,12 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
         if "override_model" in server_raw:
             server.override_model = str(server_raw["override_model"]).strip()
 
+    if ollama_fallback_url and not ollama_url:
+        raise RuntimeError(
+            "ollama_fallback_url is set but ollama_url is empty. "
+            "You must configure ollama_url when using ollama_fallback_url."
+        )
+
     # Validate that each model's endpoint has a corresponding non-empty URL
     _endpoint_urls = {
         "anthropic": anthropic_url,
@@ -149,6 +157,7 @@ def load_config(path: str = "proxy.config") -> ProxyConfig:
     return ProxyConfig(
         anthropic_url=anthropic_url.rstrip("/"),
         ollama_url=ollama_url.rstrip("/"),
+        ollama_fallback_url=ollama_fallback_url.rstrip("/"),
         openai_url=openai_url.rstrip("/"),
         models=models,
         server=server,

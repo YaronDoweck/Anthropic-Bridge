@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import AsyncGenerator, Optional
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,7 @@ class RequestLogger:
         while accumulating text, token counts, and stop_reason from SSE events.
         Writes a JSONL entry after the stream is exhausted (or on disconnect).
         """
+        stream_start = time.monotonic()
         accumulated_text: list[str] = []
         input_tokens: Optional[int] = None
         output_tokens: Optional[int] = None
@@ -162,9 +164,16 @@ class RequestLogger:
         # Thinking tracking: index -> [parts]
         thinking_blocks: dict[int, list] = {}
         current_block_index: Optional[int] = None
+        first_chunk_time: Optional[float] = None
+        estimated_tokens: int = 0
+        last_rate_log_time: float = 0.0
+        last_rate_log_tokens: int = 0
 
         try:
             async for chunk in original_generator:
+                if first_chunk_time is None:
+                    first_chunk_time = time.monotonic()
+                    last_rate_log_time = first_chunk_time
                 yield chunk
                 # Parse SSE lines, handling chunk-boundary splits
                 try:
@@ -215,6 +224,14 @@ class RequestLogger:
                                 text = delta.get("text", "")
                                 if text:
                                     accumulated_text.append(text)
+                                    estimated_tokens += max(1, len(text) // 4)
+                                    now = time.monotonic()
+                                    if first_chunk_time is not None and (now - last_rate_log_time >= 5.0 or estimated_tokens - last_rate_log_tokens >= 50):
+                                        elapsed = now - first_chunk_time
+                                        if elapsed > 0:
+                                            logger.info("STREAM %s: ~%d estimated tokens in %.1fs = %.1f tok/s (in progress)", model, estimated_tokens, elapsed, estimated_tokens / elapsed)
+                                            last_rate_log_time = now
+                                            last_rate_log_tokens = estimated_tokens
                             elif delta.get("type") == "input_json_delta":
                                 idx = event_data.get("index", current_block_index)
                                 if idx in tool_blocks:
@@ -227,6 +244,14 @@ class RequestLogger:
                                     thinking = delta.get("thinking", "")
                                     if thinking:
                                         thinking_blocks[idx].append(thinking)
+                                        estimated_tokens += max(1, len(thinking) // 4)
+                                        now = time.monotonic()
+                                        if first_chunk_time is not None and (now - last_rate_log_time >= 5.0 or estimated_tokens - last_rate_log_tokens >= 50):
+                                            elapsed = now - first_chunk_time
+                                            if elapsed > 0:
+                                                logger.info("STREAM %s: ~%d estimated tokens in %.1fs = %.1f tok/s (in progress, thinking)", model, estimated_tokens, elapsed, estimated_tokens / elapsed)
+                                                last_rate_log_time = now
+                                                last_rate_log_tokens = estimated_tokens
 
                         elif event_type == "message_delta":
                             delta = event_data.get("delta", {})
@@ -263,6 +288,17 @@ class RequestLogger:
                 partial_json = "".join(block["parts"])
                 response_parts.append(f"[tool_use: {name}] {partial_json}".strip())
             response_text = "\n".join(response_parts)
+            if first_chunk_time is not None:
+                ttft = first_chunk_time - stream_start
+                elapsed = time.monotonic() - first_chunk_time
+                if elapsed > 0:
+                    if output_tokens is not None:
+                        logger.info("STREAM %s: TTFT=%.2fs | %d tokens in %.1fs = %.1f tok/s", model, ttft, output_tokens, elapsed, output_tokens / elapsed)
+                    else:
+                        logger.info("STREAM %s: TTFT=%.2fs | ~%d estimated tokens in %.1fs = ~%.1f tok/s (estimated)", model, ttft, estimated_tokens, elapsed, estimated_tokens / elapsed)
+            else:
+                ttft = time.monotonic() - stream_start
+                logger.info("STREAM %s: no tokens received (TTFT>%.2fs)", model, ttft)
             entry = {
                 "timestamp": timestamp,
                 "model": model,

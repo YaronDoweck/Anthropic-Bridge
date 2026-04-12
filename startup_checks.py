@@ -133,48 +133,62 @@ def run_startup_checks(config: ProxyConfig) -> subprocess.Popen | None:
 
     # Step 5: check if Ollama server is running
     ollama_proc: subprocess.Popen | None = None
+    local_ollama_url = "http://127.0.0.1:11434"
+    active_ollama_url = config.ollama_url  # tracks which URL is actually reachable
 
     if not _check_ollama_server(config.ollama_url):
-        if not interactive:
+        # Primary URL unreachable — check if a local Ollama is already running
+        local_already_running = _check_ollama_server(local_ollama_url)
+
+        if local_already_running and config.ollama_url != local_ollama_url:
+            print(
+                f"[startup] Primary Ollama URL ({config.ollama_url}) is unreachable, "
+                "but a local Ollama instance is already running. Continuing with local instance."
+            )
+            active_ollama_url = local_ollama_url
+        elif local_already_running:
+            print("[startup] A local Ollama instance is already running on 127.0.0.1:11434.")
+        elif not interactive:
             raise RuntimeError(
                 "Ollama is not running. Start it with: ollama serve"
             )
+        else:
+            print("[startup] Ollama server is not running. Starting it...")
 
-        print("[startup] Ollama server is not running. Starting it...")
-
-        # Start ollama serve in background
-        ollama_proc = subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=None,  # inherit terminal output
-            stderr=None,
-        )
-
-        # Wait up to 5 seconds for the server to come up
-        started = False
-        for _ in range(10):
-            time.sleep(0.5)
-            if _check_ollama_server(config.ollama_url):
-                started = True
-                break
-
-        if not started:
-            ollama_proc.terminate()
-            try:
-                ollama_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                ollama_proc.kill()
-            raise RuntimeError(
-                "Ollama server did not start within 5 seconds. "
-                "Run 'ollama serve' manually and retry."
+            # Start ollama serve in background
+            ollama_proc = subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=None,  # inherit terminal output
+                stderr=None,
             )
 
-        print("[startup] Ollama server started.")
+            # Wait up to 5 seconds for the server to come up
+            started = False
+            for _ in range(10):
+                time.sleep(0.5)
+                if _check_ollama_server(local_ollama_url):
+                    started = True
+                    break
+
+            if not started:
+                ollama_proc.terminate()
+                try:
+                    ollama_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    ollama_proc.kill()
+                raise RuntimeError(
+                    "Ollama server did not start within 5 seconds. "
+                    "Run 'ollama serve' manually and retry."
+                )
+
+            active_ollama_url = local_ollama_url
+            print("[startup] Ollama server started.")
     else:
         print("[startup] Ollama server is running.")
 
     # Step 6: check configured models are available
     print("[startup] Checking configured models...")
-    available_raw = _get_available_models(config.ollama_url)
+    available_raw = _get_available_models(active_ollama_url)
     available_normalized = {_normalize_model_name(m) for m in available_raw}
     missing = [
         name for name in ollama_models

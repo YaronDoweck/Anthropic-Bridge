@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from contextlib import asynccontextmanager
@@ -14,6 +15,8 @@ from fastapi.responses import JSONResponse, Response
 import logging
 
 from config import ProxyConfig, load_config
+from config_watcher import ConfigWatcher
+from handlers.ollama import OllamaHandler
 from logging_config import setup_logging
 from request_logger import RequestLogger, RawLogger
 from router import ProxyRouter
@@ -77,6 +80,8 @@ router_instance: Optional[ProxyRouter] = None
 async def lifespan(app: FastAPI):
     global router_instance
     ollama_proc = run_startup_checks(config)
+    watcher: Optional[ConfigWatcher] = None
+    watcher_task: Optional[asyncio.Task] = None
     try:
         async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
             output_dir = config.server.output_dir or None
@@ -85,8 +90,30 @@ async def lifespan(app: FastAPI):
             raw_logger = RawLogger(raw_log_dir) if raw_log_dir else None
             app.state.raw_logger = raw_logger
             router_instance = ProxyRouter(config, client, request_logger=req_logger, raw_logger=raw_logger)
+
+            initial_ollama = router_instance.handlers.get("ollama")
+            if isinstance(initial_ollama, OllamaHandler) and initial_ollama._fallback_url:
+                await initial_ollama.start_health_checker()
+
+            watcher = ConfigWatcher(
+                path="proxy.config",
+                router=router_instance,
+                http_client=client,
+                apply_env_overrides=_apply_env_overrides,
+            )
+            watcher_task = asyncio.create_task(watcher.run())
+
             yield
     finally:
+        # Shutdown order: (1) stop config watcher, (2) await watcher task,
+        # (3) stop current ollama handler's health checker, (4) rest of cleanup.
+        if watcher is not None:
+            watcher.stop()
+        if watcher_task is not None:
+            await watcher_task
+        current_ollama = router_instance.handlers.get("ollama") if router_instance else None
+        if current_ollama is not None and hasattr(current_ollama, "stop_health_checker"):
+            await current_ollama.stop_health_checker()
         router_instance = None
         app.state.raw_logger = None
         if ollama_proc is not None:
